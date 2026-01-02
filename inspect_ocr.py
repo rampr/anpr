@@ -46,6 +46,17 @@ sharp_up = cv2.addWeighted(up, 1.8, blur, -0.8, 0)
 cv2.imwrite("ocr_debug_sharp_up.png", sharp_up)
 print("Wrote ocr_debug_sharp_up.png")
 
+def _pad_border(bgr, pad=24):
+    return cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+
+# Padded + 6x upscale + gentle sharpen (often helps preserve diagonals like 'M' and 'W')
+pad6 = _pad_border(img, pad=24)
+up6 = cv2.resize(pad6, None, fx=6.0, fy=6.0, interpolation=cv2.INTER_CUBIC)
+blur6 = cv2.GaussianBlur(up6, (0, 0), 1.0)
+sharp6 = cv2.addWeighted(up6, 1.4, blur6, -0.4, 0)
+cv2.imwrite("ocr_debug_pad6_sharp6.png", sharp6)
+print("Wrote ocr_debug_pad6_sharp6.png")
+
 # -----------------
 # EasyOCR debug
 # -----------------
@@ -61,6 +72,22 @@ else:
     res_clahe = reader.readtext(clahe_bgr, allowlist=allow)
     res_lab_clahe = reader.readtext(lab_clahe_bgr, allowlist=allow)
     res_sharp_up = reader.readtext(sharp_up, allowlist=allow)
+
+    res_pad6 = reader.readtext(sharp6, allowlist=allow)
+
+    # Beamsearch + magnification + contrast tuning (helps with ambiguous glyphs)
+    res_pad6_beam = reader.readtext(
+        sharp6,
+        allowlist=allow,
+        detail=1,
+        decoder="beamsearch",
+        beamWidth=5,
+        mag_ratio=2.0,
+        contrast_ths=0.1,
+        adjust_contrast=0.7,
+        text_threshold=0.6,
+        low_text=0.3,
+    )
 
     def _order_quad(pts):
         # pts: list of 4 (x,y)
@@ -141,3 +168,5 @@ else:
     _render_easy(res_clahe, clahe_bgr, "ocr_debug_easyocr_clahe.png")
     _render_easy(res_lab_clahe, lab_clahe_bgr, "ocr_debug_easyocr_lab_clahe.png")
     _render_easy(res_sharp_up, sharp_up, "ocr_debug_easyocr_sharp_up.png")
+    _render_easy(res_pad6, sharp6, "ocr_debug_easyocr_pad6_sharp6.png")
+    _render_easy(res_pad6_beam, sharp6, "ocr_debug_easyocr_pad6_sharp6_beam.png")
