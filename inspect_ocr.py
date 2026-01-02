@@ -1,8 +1,6 @@
 import sys
 import cv2
 import numpy as np
-import pytesseract
-from pytesseract import Output
 import math
 
 # Optional EasyOCR (install with: pip install easyocr)
@@ -10,13 +8,6 @@ try:
     import easyocr
 except Exception:
     easyocr = None
-
-# Optional PaddleOCR (install with: pip install paddlepaddle paddleocr)
-try:
-    from paddleocr import PaddleOCR, TextRecognition
-except Exception:
-    PaddleOCR = None
-    TextRecognition = None
 
 
 img_path = sys.argv[1]
@@ -32,42 +23,28 @@ th = cv2.adaptiveThreshold(
     gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
 )
 
-# -----------------
-# Tesseract debug
-# -----------------
-config = "--oem 1 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-d = pytesseract.image_to_data(th, config=config, output_type=Output.DICT)
+# CLAHE variant (often helps low-light / low-contrast plates)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+clahe_gray = clahe.apply(gray)
+clahe_bgr = cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR)
+cv2.imwrite("ocr_debug_clahe.png", clahe_bgr)
+print("Wrote ocr_debug_clahe.png")
 
-out_tess = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
-words = []
-confs = []
+# LAB-CLAHE variant (often preserves character stroke structure better than grayscale CLAHE)
+lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+L, A, B = cv2.split(lab)
+clahe_L = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(L)
+lab2 = cv2.merge([clahe_L, A, B])
+lab_clahe_bgr = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+cv2.imwrite("ocr_debug_lab_clahe.png", lab_clahe_bgr)
+print("Wrote ocr_debug_lab_clahe.png")
 
-for i in range(len(d["text"])):
-    txt = d["text"][i].strip()
-    conf = float(d["conf"][i]) if d["conf"][i] != "-1" else -1
-    if txt and conf >= 0:
-        x, y, w, h = d["left"][i], d["top"][i], d["width"][i], d["height"][i]
-        cv2.rectangle(out_tess, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(
-            out_tess,
-            f"{txt} {conf:.0f}",
-            (x, max(0, y - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-        words.append(txt)
-        confs.append(conf)
-
-raw_tess = pytesseract.image_to_string(th, config=config)
-mean_conf = (sum(confs) / len(confs)) if confs else 0.0
-print("TESSERACT_RAW:", raw_tess.strip())
-print("TESSERACT_JOINED:", "".join(words))
-print(f"TESSERACT_MEAN_CONF: {mean_conf:.1f}")
-
-cv2.imwrite("ocr_debug_tesseract.png", out_tess)
-print("Wrote ocr_debug_tesseract.png")
+# Sharpened + upscaled color variant (helps preserve diagonals like 'M' under mild blur)
+up = cv2.resize(img, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+blur = cv2.GaussianBlur(up, (0, 0), 1.2)
+sharp_up = cv2.addWeighted(up, 1.8, blur, -0.8, 0)
+cv2.imwrite("ocr_debug_sharp_up.png", sharp_up)
+print("Wrote ocr_debug_sharp_up.png")
 
 # -----------------
 # EasyOCR debug
@@ -78,8 +55,12 @@ else:
     # Reader init is heavy; for single-file debug it's fine.
     reader = easyocr.Reader(["en"], gpu=False)
     # Run on the original image and on the thresholded image
-    res_img = reader.readtext(img)
-    res_th = reader.readtext(th)
+    allow = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    res_img = reader.readtext(img, allowlist=allow)
+    res_th = reader.readtext(th, allowlist=allow)
+    res_clahe = reader.readtext(clahe_bgr, allowlist=allow)
+    res_lab_clahe = reader.readtext(lab_clahe_bgr, allowlist=allow)
+    res_sharp_up = reader.readtext(sharp_up, allowlist=allow)
 
     def _order_quad(pts):
         # pts: list of 4 (x,y)
@@ -157,85 +138,6 @@ else:
     # For thresholded image, convert to 3-channel for drawing
     th_bgr = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
     _render_easy(res_th, th_bgr, "ocr_debug_easyocr_th.png")
-
-# -----------------
-# PaddleOCR debug (PaddleOCR 3.x)
-# -----------------
-if PaddleOCR is None:
-    print("PADDLEOCR: not installed. Install with: pip install paddlepaddle paddleocr")
-else:
-    # For English plates
-    ocr = PaddleOCR(lang="en", use_textline_orientation=False)
-    rec_only = None
-    if TextRecognition is not None:
-        # Recognition-only model (best for tightly-cropped plate images)
-        rec_only = TextRecognition(model_name="PP-OCRv5_server_rec")
-
-    def _run_paddle(img_in, out_name):
-        pred = ocr.predict(img_in)  # <- no cls/det kwargs in 3.x
-        out = img_in.copy()
-        print(f"\nPADDLEOCR_RESULTS ({out_name}):")
-
-        if not pred:
-            print("  (no result objects returned from pipeline; trying recognition-only)")
-            if rec_only is not None:
-                out_rec = rec_only.predict(input=img_in, batch_size=1)
-                if out_rec:
-                    jsr = getattr(out_rec[0], "json", {})
-                    text = jsr.get("res", {}).get("rec_text", "")
-                    conf = jsr.get("res", {}).get("rec_score", 0.0)
-                    print(f"  REC_ONLY text={text!r} conf={conf:.3f}")
-                else:
-                    print("  REC_ONLY (no result)")
-            cv2.imwrite(out_name, out)
-            print(f"Wrote {out_name}")
-            return
-
-        js = getattr(pred[0], "json", None)
-        if not js:
-            print("  (no .json on result; unexpected PaddleOCR return)")
-            cv2.imwrite(out_name, out)
-            print(f"Wrote {out_name}")
-            return
-
-        texts = js.get("rec_texts", [])
-        scores = js.get("rec_scores", [])
-        polys = js.get("rec_polys", [])  # list of polygons
-
-        if not texts:
-            print("  (no text detected by pipeline; trying recognition-only)")
-            if rec_only is not None:
-                out_rec = rec_only.predict(input=img_in, batch_size=1)
-                if out_rec:
-                    jsr = getattr(out_rec[0], "json", {})
-                    text = jsr.get("res", {}).get("rec_text", "")
-                    conf = jsr.get("res", {}).get("rec_score", 0.0)
-                    print(f"  REC_ONLY text={text!r} conf={conf:.3f}")
-                else:
-                    print("  REC_ONLY (no result)")
-            cv2.imwrite(out_name, out)
-            print(f"Wrote {out_name}")
-            return
-
-        for text, conf, poly in zip(texts, scores, polys):
-            # poly is an array/list of points
-            pts = [(int(p[0]), int(p[1])) for p in poly]
-            cv2.polylines(out, [np.array(pts)], isClosed=True, color=(255, 0, 255), thickness=2)
-            tl = pts[0]
-            cv2.putText(
-                out,
-                f"{text} {conf:.2f}",
-                (tl[0], max(0, tl[1] - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 0, 255),
-                2,
-            )
-            print(f"  text={text!r} conf={conf:.3f}")
-
-        cv2.imwrite(out_name, out)
-        print(f"Wrote {out_name}")
-
-    _run_paddle(img, "ocr_debug_paddleocr_img.png")
-    th_bgr2 = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
-    _run_paddle(th_bgr2, "ocr_debug_paddleocr_th.png")
+    _render_easy(res_clahe, clahe_bgr, "ocr_debug_easyocr_clahe.png")
+    _render_easy(res_lab_clahe, lab_clahe_bgr, "ocr_debug_easyocr_lab_clahe.png")
+    _render_easy(res_sharp_up, sharp_up, "ocr_debug_easyocr_sharp_up.png")
