@@ -1,2 +1,6 @@
 venv
 .DS_Store
+debug
+ocr_*.png
+annotated
+plates*
